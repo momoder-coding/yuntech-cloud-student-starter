@@ -30,7 +30,15 @@ IID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["w03_insta
 HOST=$(python3 deploy/awsx.py ec2 describe-instances --instance-ids "$IID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 [[ -n $HOST && $HOST != None ]] || { echo "STOP: 查不到公開位址（主機是 stopped？）" >&2; exit 1; }
-echo "目標主機 $IID（位址 $HOST，部署前即時查得）"
+# 替代通道：本環境無法對外連 22，可用 deploy/ssm-tunnel.sh start 後指定
+#   SSH_HOST=127.0.0.1 SSH_PORT=2222 bash deploy/deploy.sh
+SSH_HOST=${SSH_HOST:-$HOST}
+SSH_PORT=${SSH_PORT:-22}
+if [[ $SSH_PORT != 22 || $SSH_HOST != "$HOST" ]]; then
+  echo "目標主機 $IID（位址 $HOST，部署前即時查得；經替代通道 $SSH_HOST:$SSH_PORT 連線）"
+else
+  echo "目標主機 $IID（位址 $HOST，部署前即時查得）"
+fi
 
 cat <<PLAN
 
@@ -45,15 +53,15 @@ PLAN
 read -r -p "確認請輸入 $CONFIRM_WORD：" a
 [[ $a == $CONFIRM_WORD ]] || { echo "取消，未部署"; exit 1; }
 
-SSH_OPTS=(-i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -o BatchMode=yes)
+SSH_OPTS=(-i "$KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -o BatchMode=yes)
 remote() {  # remote <命令>  以 root 在主機上執行；連線失敗時重試（出口 IP 會輪替）
   local cmd=$1 attempt
   for attempt in $(seq 1 "$TRIES"); do
-    if ssh "${SSH_OPTS[@]}" "ec2-user@$HOST" "$cmd"; then return 0; fi
+    if ssh "${SSH_OPTS[@]}" "ec2-user@$SSH_HOST" "$cmd"; then return 0; fi
     echo "  第 $attempt 次 SSH 未通，重試…" >&2
     sleep 3
   done
-  echo "STOP: SSH 連續 $TRIES 次失敗（本環境到主機的 22 埠問題，見 .local/w03-evidence/access-findings.md）" >&2
+  echo "STOP: SSH 連續 $TRIES 次失敗（見 .local/w03-evidence/access-findings.md）" >&2
   return 1
 }
 
@@ -66,11 +74,9 @@ echo "[3/4] 放秘密檔並重啟服務"
 remote 'sudo bash -c "umask 077; cat > /etc/inspection/app.env; chown root:root /etc/inspection/app.env; chmod 600 /etc/inspection/app.env"' < "$ENV_FILE"
 remote 'sudo systemctl restart inspection && systemctl is-active inspection'
 
-echo "[4/4] 驗證 /health（version 與 auth_configured；出口會輪替，會重試）"
-for attempt in $(seq 1 25); do
-  body=$(curl -s --max-time 8 "http://$HOST/health" || true)
-  if [[ -n $body ]]; then
-    line=$(python3 - "$body" "$COMMIT" <<'PY'
+echo "[4/4] 驗證 /health（主機自身檢視為準；外部檢視只作紀錄，因出口會輪替）"
+body=$(remote 'curl -s --max-time 8 http://127.0.0.1/health')
+line=$(python3 - "$body" "$COMMIT" <<'PY'
 import json, sys
 try:
     data = json.loads(sys.argv[1])
@@ -81,10 +87,19 @@ print(f"version={data.get('version')} auth_configured={data.get('auth_configured
       f"→ {'符合' if ok else '不符'}")
 PY
 )
-    echo "  第 $attempt 次：$line"
-    [[ $line == *"→ 符合" ]] && exit 0
+echo "  主機自身（經 SSH 打 127.0.0.1）：$line"
+[[ $line == *"→ 符合" ]] || { echo "STOP: 主機上檢視的 version 或 auth_configured 不符" >&2; exit 1; }
+
+echo "  外部檢視（最多 10 次，成功即止）"
+for attempt in $(seq 1 10); do
+  ext=$(curl -s --max-time 8 "http://$HOST/health" || true)
+  if [[ -n $ext ]]; then
+    summary=$(printf '%s' "$ext" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print("version=%s auth_configured=%s" % (d.get("version"), d.get("auth_configured")))' 2>/dev/null || echo unparsable)
+    echo "    第 $attempt 次：$summary"
+    break
   fi
   sleep 2
 done
-echo "STOP: 25 次內沒取得符合的 /health" >&2
-exit 1
+exit 0
