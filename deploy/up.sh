@@ -81,7 +81,7 @@ cat <<PLAN
   3. EC2 instance    t3.micro、AMI $AMI、root EBS gp3 8GiB 加密、終止時刪除、IMDSv2 required
   部署 commit        $COMMIT
   標籤               course=$COURSE week=$WEEK group=$GROUP owner=$OWNER
-  費用               約 US$0.05／數小時（依當期 EC2、EBS、公開 IPv4 計價頁）
+  費用               約 US\$0.05／數小時（依當期 EC2、EBS、公開 IPv4 計價頁）
   回收               deploy/down.sh --stop（保留）或 deploy/down.sh（終止並刪除 SG、key pair）
 PLAN
 read -r -p "確認無誤請輸入 $CONFIRM_WORD：" answer
