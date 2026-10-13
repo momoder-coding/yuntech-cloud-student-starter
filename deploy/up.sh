@@ -102,6 +102,7 @@ awsx ec2 describe-security-groups --group-ids "$SG_ID" \
 echo "[1] SG $SG_ID 已建立，規則寫入 $EVID/sg-rules.json"
 
 # ── 2. Key pair（私鑰只留本機，不讀不印）──────────────────
+mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
 if [[ ! -f $KEY_PATH ]]; then
   ssh-keygen -t ed25519 -N '' -C "$CODE w03" -f "$KEY_PATH" >/dev/null
 fi
@@ -113,6 +114,7 @@ record w03_key_name "$KP_NAME"; record w03_key_pair_id "$KP_ID"
 echo "[2] Key pair $KP_NAME（$KP_ID）已匯入（只匯入公鑰）"
 
 # ── 3. 打包 user data ＋ 建立主機 ────────────────────────
+rm -f .local/w03-user-data.sh
 bash deploy/make-user-data.sh "$COMMIT" .local/w03-user-data.sh >/dev/null
 UD_SIZE=$(stat -c %s .local/w03-user-data.sh)
 (( UD_SIZE < 16384 )) || { echo "STOP: user data $UD_SIZE bytes 超過 16 KiB" >&2; exit 1; }
