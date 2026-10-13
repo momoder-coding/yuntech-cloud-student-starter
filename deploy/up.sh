@@ -36,9 +36,17 @@ PY
 utcnow() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ── 前置檢查 ─────────────────────────────────────────────
-if [[ -n $(git status --porcelain) ]]; then
-  echo "STOP: 工作目錄不乾淨，先 commit 再打包（未 commit 的修改不會進 user data）" >&2
+# 打包器（deploy/make_user_data.py）只取該 commit 的 app/ 與 deploy/nginx.conf，
+# 所以只要求會被打包的路徑乾淨；其他檔案（例如本機的 opencode.json 設定）髒掉只警告。
+if [[ -n $(git status --porcelain -- app deploy) ]]; then
+  echo "STOP: app/ 或 deploy/ 有未 commit 的修改；未 commit 的內容不會進 user data，先 commit 再跑。" >&2
+  git status --porcelain -- app deploy >&2
   exit 1
+fi
+other=$(git status --porcelain -- . ":(exclude)app" ":(exclude)deploy" || true)
+if [[ -n $other ]]; then
+  echo "提醒：以下檔案有未 commit 的修改，不在打包範圍內（僅警告，不影響部署內容）："
+  printf '%s\n' "$other"
 fi
 if [[ -f $RES ]] && python3 - "$RES" <<'PY'
 import json, sys
