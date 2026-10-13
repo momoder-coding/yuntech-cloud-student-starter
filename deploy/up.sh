@@ -62,8 +62,10 @@ fi
 VPC=$(awsx ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
 SUBNET=${SUBNET:-$(awsx ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" Name=default-for-az,Values=true \
   --query 'sort_by(Subnets,&AvailabilityZone)[0].SubnetId' --output text)}
+# kernel-6.1 是 AL2023 的預設核心。不加這個條件時，多個版本的 CreationDate 可能同分，
+# sort_by 會任意挑到 kernel-6.12/6.18，造成每次部署的 AMI 不可重現。要換核心請在 .local/w03.env 設 AMI。
 AMI=${AMI:-$(awsx ec2 describe-images --owners amazon \
-  --filters Name=name,Values='al2023-ami-2023*-x86_64' Name=state,Values=available Name=architecture,Values=x86_64 \
+  --filters Name=name,Values='al2023-ami-2023*-kernel-6.1-x86_64' Name=state,Values=available Name=architecture,Values=x86_64 \
   --query 'Images|sort_by(@,&CreationDate)[-1].ImageId' --output text)}
 CIDR=${CIDR:-$(curl -s https://checkip.amazonaws.com | tr -d '\n')/32}
 SG_NAME=${CODE}-w03-sg
