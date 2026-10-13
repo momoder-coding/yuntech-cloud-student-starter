@@ -1,0 +1,7 @@
+{
+  "event_id": "g06-m01-0001",
+  "device_id": "g06-m01-d01",
+  "observed_at": "2026-10-13T18:30:00+08:00",
+  "type": "status",
+  "note": "synthetic fixture for course use"
+}
