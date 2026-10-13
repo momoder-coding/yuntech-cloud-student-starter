@@ -125,3 +125,22 @@ Path(sys.argv[1]).write_text(json.dumps({
 }, indent=2) + "\n", encoding="utf-8")
 PY
 echo "回收紀錄寫入 $EVID/destroyed.json（main 的 terminated 紀錄會暫留一陣子，屬正常）"
+
+# 把本輪 w03_* 移到 history 後清除，讓 up.sh 可以從同一個 commit 重建第二台
+python3 - "$RES" <<'PY'
+import datetime, json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+data = json.loads(p.read_text(encoding="utf-8"))
+ended = {k: v for k, v in data.items() if k.startswith("w03_")}
+if ended:
+    data.setdefault("history", []).append({
+        "utc": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "action": "terminate",
+        "resources": ended,
+    })
+    for key in ended:
+        data.pop(key)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"已把 {len(ended)} 個 w03_* 欄位移入 history，可重建第二台")
+PY
