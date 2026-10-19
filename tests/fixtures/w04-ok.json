@@ -1,0 +1,11 @@
+{
+  "expect_status": 201,
+  "expect_field": null,
+  "event": {
+    "event_id": "g06-m01-0001",
+    "device_id": "g06-m01-d01",
+    "observed_at": "2026-10-19T22:00:00+08:00",
+    "type": "status",
+    "note": "W4 first inspection: pump room normal"
+  }
+}

@@ -401,6 +401,130 @@ def cmd_down(args):
     save_resources(res)
 
 
+# ---------- W4：start（T1 恢復）與 deploy ----------
+
+def sg_cidrs(ops, sg_id):
+    perms = ops.aws("ec2", "describe-security-groups", "--group-ids", sg_id)["SecurityGroups"][0]["IpPermissions"]
+    return {(p["FromPort"], r["CidrIp"]) for p in perms for r in p.get("IpRanges", [])}
+
+
+def cmd_start(args):
+    ops = Ops()
+    cfg = load_config(args)
+    res = load(RESOURCES, {})
+    inst = describe_instance(ops, res["instance_id"])
+    check_owner_tags(f"instance {res['instance_id']}", inst.get("Tags"), cfg)
+    old_ip = res.get("public_ip")
+    if inst["State"]["Name"] == "stopped":
+        confirm([f"Plan (start): START instance {res['instance_id']} (stopped); no new resources"])
+        ops.aws("ec2", "start-instances", "--instance-ids", res["instance_id"])
+        wait_state(ops, res["instance_id"], "running")
+    else:
+        log(f"instance is already {inst['State']['Name']}; not starting it again")
+    ip = describe_instance(ops, res["instance_id"])["PublicIpAddress"]
+    res["public_ip"] = ip
+    save_resources(res)
+    log(f"public IP: old {old_ip} -> new {ip} (Start assigns a new address; no EIP in this course)")
+    new = f"{egress_ip()}/32"
+    rules = sg_cidrs(ops, res["sg_id"])
+    log(f"Codespace egress now {new}; SG {res['sg_id']} rules {sorted(rules)}")
+    if rules != {(22, new), (80, new)}:
+        old = sorted({c for _, c in rules})
+        confirm([f"Plan: replace SG {res['sg_id']} source {old} -> {new} on TCP 22 and 80 (exact /32, not wider)"])
+        for port, cidr in rules:
+            ops.aws("ec2", "revoke-security-group-ingress", "--group-id", res["sg_id"], "--protocol", "tcp",
+                    "--port", str(port), "--cidr", cidr)
+        for port, desc in ((22, "SSH"), (80, "HTTP")):
+            perm = [{"IpProtocol": "tcp", "FromPort": port, "ToPort": port,
+                     "IpRanges": [{"CidrIp": new, "Description": f"Codespace {desc}"}]}]
+            ops.aws("ec2", "authorize-security-group-ingress", "--group-id", res["sg_id"],
+                    "--ip-permissions", json.dumps(perm))
+        res["source_cidr"] = new
+        save_resources(res)
+        cfg["source_cidr"] = new
+        lab.atomic_write(CONFIG, json.dumps(cfg) + "\n")
+        log(f"SG rules now {sorted(sg_cidrs(ops, res['sg_id']))}")
+    for _ in range(100):
+        exit_code, code, body, _ = curl(f"http://{ip}/health", 5)
+        if code == "200":
+            break
+        time.sleep(3)
+    log(f"/health: http={code} body={body}")
+
+
+def secrets_payload():
+    """組合要放上主機 /etc/inspection/app.env 的內容；只檢查權限，不印出內容。"""
+    parts = []
+    for name, required in (("app.env", True), ("db.env", False)):
+        path = LOCAL / name
+        if not path.exists():
+            if required:
+                raise lab.LabError(f".local/{name} is missing; generate it first (README W4).")
+            continue
+        mode = path.stat().st_mode & 0o777
+        if mode != 0o600:
+            raise lab.LabError(f".local/{name} must be 600 (is {oct(mode)[2:]}); stop.")
+        text = path.read_text()
+        parts.append(text if text.endswith("\n") else text + "\n")
+    return "".join(parts).encode(), [p for p in ("app.env", "db.env") if (LOCAL / p).exists()]
+
+
+INSTALL = 'f=$(mktemp) && cat > "$f" && sudo bash "$f" > /tmp/inspection-install.log 2>&1; rc=$?; rm -f "$f"; ' \
+          'tail -n 3 /tmp/inspection-install.log; exit $rc'
+PUT_SECRETS = ("sudo sh -c 'umask 077; install -d -m 755 /etc/inspection && cat > /etc/inspection/.app.env.new && "
+               "chown root:root /etc/inspection/.app.env.new && chmod 600 /etc/inspection/.app.env.new && "
+               "mv -f /etc/inspection/.app.env.new /etc/inspection/app.env && systemctl restart inspection && "
+               "stat -c \"%a %U %n\" /etc/inspection /etc/inspection/app.env'")
+
+
+def cmd_deploy(args):
+    ops = Ops()
+    cfg = load_config(args)
+    res = load(RESOURCES, {})
+    inst = describe_instance(ops, res["instance_id"])
+    check_owner_tags(f"instance {res['instance_id']}", inst.get("Tags"), cfg)
+    if inst["State"]["Name"] != "running":
+        raise lab.LabError(f"Instance is {inst['State']['Name']}; run `python3 deploy/ops.py start` first.")
+    ip = inst["PublicIpAddress"]
+    res["public_ip"] = ip
+    payload, secret_files = secrets_payload()
+    warn_dirty()
+    sha, user_data, size = build_user_data(args.commit)
+    confirm([
+        "Plan (deploy.sh) — update the SAME host, no new resources:",
+        f"  target   {res['instance_id']} at {ip}",
+        f"  commit   {sha} (user data {size} bytes, committed files only)",
+        f"  secrets  .local/{' + .local/'.join(secret_files)} -> /etc/inspection/app.env (root, 600) via SSH stdin",
+        "  then     restart inspection and check /health version",
+    ])
+    t0 = time.monotonic()
+    r = ssh(ip, INSTALL, stdin=user_data.read_bytes(), timeout=900)
+    log(f"installer rc={r.returncode}: {r.stdout.decode().strip()[-300:]}")
+    if r.returncode:
+        raise lab.LabError("Installer failed on the host; see /tmp/inspection-install.log there.")
+    r = ssh(ip, PUT_SECRETS, stdin=payload)
+    del payload
+    if r.returncode:
+        raise lab.LabError("Placing the secret file failed (output withheld).")
+    log("secret file placed: " + r.stdout.decode().strip().replace("\n", "; "))
+    expect_db = "db.env" in secret_files
+    for _ in range(60):
+        exit_code, code, body, _ = curl(f"http://{ip}/health", 5)
+        try:
+            h = json.loads(body) if code == "200" else {}
+        except ValueError:
+            h = {}
+        if h.get("version") == sha and h.get("auth_configured") is True and (
+                not expect_db or h.get("db_configured") is True):
+            res["commit"] = sha
+            save_resources(res)
+            log(f"/health: {body}")
+            log(f"deploy.sh done in {time.monotonic() - t0:.0f}s; version == {sha}")
+            return
+        time.sleep(2)
+    raise lab.LabError(f"/health did not report version {sha} with secrets configured; last: http={code} {body}")
+
+
 # ---------- 進入點 ----------
 
 def main():
@@ -410,13 +534,16 @@ def main():
     up.add_argument("--commit", default="HEAD")
     down = sub.add_parser("down", help="W3：以記錄的 ID 回收（--stop 只停止）")
     down.add_argument("--stop", action="store_true")
-    for p in (up, down):
+    start = sub.add_parser("start", help="W4 T1：啟動保留的主機、記錄新位址、核對 SG 的 /32")
+    deploy = sub.add_parser("deploy", help="W4：把已 commit 的版本與秘密檔部署到同一台主機")
+    deploy.add_argument("--commit", default="HEAD")
+    for p in (up, down, start, deploy):
         p.add_argument("--group")
         p.add_argument("--owner")
         p.add_argument("--source-cidr", dest="source_cidr")
     args = parser.parse_args()
     try:
-        {"up": cmd_up, "down": cmd_down}[args.command](args)
+        {"up": cmd_up, "down": cmd_down, "start": cmd_start, "deploy": cmd_deploy}[args.command](args)
     except (lab.LabError, EOFError, subprocess.CalledProcessError, KeyError, ValueError) as exc:
         print(f"STOP: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

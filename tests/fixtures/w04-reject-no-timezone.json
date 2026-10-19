@@ -1,0 +1,10 @@
+{
+  "expect_status": 400,
+  "expect_field": "observed_at",
+  "event": {
+    "event_id": "g06-m01-0002",
+    "device_id": "g06-m01-d01",
+    "observed_at": "2026-10-19T22:05:00",
+    "type": "anomaly"
+  }
+}

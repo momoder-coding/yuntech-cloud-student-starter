@@ -1,0 +1,11 @@
+{
+  "expect_status": 400,
+  "expect_field": "temperature",
+  "event": {
+    "event_id": "g06-m01-0003",
+    "device_id": "g06-m01-d02",
+    "observed_at": "2026-10-19T22:10:00+08:00",
+    "type": "status",
+    "temperature": 31.5
+  }
+}
