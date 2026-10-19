@@ -7,10 +7,14 @@
 - AWS 呼叫一律經 scripts/lab.py 的 run_aws（clean_env、learnerlab profile）。
 """
 import argparse
+import ipaddress
 import json
+import os
 import re
+import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -525,6 +529,160 @@ def cmd_deploy(args):
     raise lab.LabError(f"/health did not report version {sha} with secrets configured; last: http={code} {body}")
 
 
+# ---------- W5：db-up ----------
+
+DB_ENV = LOCAL / "db.env"
+DB_NAME = "inspection"
+DB_USER = "inspection_app"
+
+
+def pick_private_cidrs(ops, vpc_id, count=2):
+    vpc = ops.aws("ec2", "describe-vpcs", "--vpc-ids", vpc_id)["Vpcs"][0]
+    used = [ipaddress.ip_network(s["CidrBlock"]) for s in ops.aws(
+        "ec2", "describe-subnets", "--filters", f"Name=vpc-id,Values={vpc_id}")["Subnets"]]
+    free = [n for n in reversed(list(ipaddress.ip_network(vpc["CidrBlock"]).subnets(new_prefix=24)))
+            if not any(n.overlaps(u) for u in used)]
+    if len(free) < count:
+        raise lab.LabError("Not enough free /24 ranges in the VPC.")
+    return [str(n) for n in free[:count]]
+
+
+def write_db_env(values):
+    LOCAL.mkdir(mode=0o700, exist_ok=True)
+    lab.atomic_write(DB_ENV, "".join(f"{k}={v}\n" for k, v in values.items()))
+
+
+def read_kv(path):
+    return dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
+
+
+def describe_db(ops, ident):
+    out, err = ops.aws_code("rds", "describe-db-instances", "--db-instance-identifier", ident)
+    return None if err else out["DBInstances"][0]
+
+
+def cmd_db_up(args):
+    ops = Ops()
+    cfg = load_config(args)
+    res = load(RESOURCES, {})
+    if not res.get("sg_id") or not res.get("vpc_id") or not res.get("az"):
+        raise lab.LabError("No host SG/VPC recorded; the W3 host must exist first.")
+    host_sg = res["sg_id"]
+    azs = sorted(z["ZoneName"] for z in ops.aws("ec2", "describe-availability-zones",
+                                                 "--filters", "Name=state,Values=available")["AvailabilityZones"])
+    other_az = next(z for z in azs if z != res["az"])
+    db_azs = [res["az"], other_az]
+    cidrs = res.get("db_subnet_cidrs") or pick_private_cidrs(ops, res["vpc_id"])
+    ident = res.get("db_instance_id") or f"{cfg['group']}-{cfg['owner']}-w05-db"
+    name = f"{cfg['group']}-{cfg['owner']}-w05"
+    skip = [k for k in ("db_route_table_id", "db_subnet_ids", "db_subnet_group", "db_sg_id", "db_instance_id")
+            if res.get(k)]
+    confirm([
+        "Plan (W5 db-up.sh) — will CREATE in VPC " + res["vpc_id"] + ":",
+        f"  route table  {name}-private: only the implicit local route (no IGW, no NAT)",
+        f"  2 subnets    {cidrs[0]} in {db_azs[0]}, {cidrs[1]} in {db_azs[1]}; both explicitly associated to it",
+        f"  subnet group {name}-db-subnets (the 2 private subnets)",
+        f"  SG-db        {name}-db: inbound TCP 5432 only, source = host SG {host_sg} (no CIDR)",
+        f"  RDS          {ident}: PostgreSQL, db.t3.micro, 20 GiB gp3, PubliclyAccessible=false, encrypted,",
+        f"               single-AZ in {db_azs[0]}, initial DB '{DB_NAME}', user '{DB_USER}', backups off",
+        "  secret       password generated here -> .local/db.env (600); never printed or put on a command line",
+        f"  tags         course={lab.COURSE} week=w05 group={cfg['group']} owner={cfg['owner']}",
+        "  cost         RDS db.t3.micro + 20 GiB gp3 while running (storage also while stopped)",
+        "  skip         already recorded: " + (", ".join(skip) or "none"),
+    ])
+    t0 = time.monotonic()
+    res["db_subnet_cidrs"] = cidrs
+    save_resources(res)
+
+    if not res.get("db_route_table_id"):
+        rt = ops.aws("ec2", "create-route-table", "--vpc-id", res["vpc_id"], "--tag-specifications",
+                     tag_spec("route-table", tags_for(cfg, "w05", f"{name}-private")))["RouteTable"]["RouteTableId"]
+        res["db_route_table_id"] = rt
+        save_resources(res)
+        log(f"created route table {rt}")
+    if not res.get("db_subnet_ids"):
+        res["db_subnet_ids"] = []
+    for i, (cidr, az) in enumerate(zip(cidrs, db_azs)):
+        if i < len(res["db_subnet_ids"]):
+            continue
+        sn = ops.aws("ec2", "create-subnet", "--vpc-id", res["vpc_id"], "--cidr-block", cidr,
+                     "--availability-zone", az, "--tag-specifications",
+                     tag_spec("subnet", tags_for(cfg, "w05", f"{name}-private-{az}")))["Subnet"]["SubnetId"]
+        res["db_subnet_ids"].append(sn)
+        save_resources(res)
+        assoc = ops.aws("ec2", "associate-route-table", "--route-table-id", res["db_route_table_id"],
+                        "--subnet-id", sn)["AssociationId"]
+        log(f"created subnet {sn} ({cidr}, {az}); associated to {res['db_route_table_id']} ({assoc})")
+    routes = ops.aws("ec2", "describe-route-tables", "--route-table-ids", res["db_route_table_id"])["RouteTables"][0]
+    log("private route table routes: " + json.dumps(
+        [{"dest": r.get("DestinationCidrBlock"), "target": r.get("GatewayId")} for r in routes["Routes"]]))
+    if not res.get("db_subnet_group"):
+        ops.aws("rds", "create-db-subnet-group", "--db-subnet-group-name", f"{name}-db-subnets",
+                "--db-subnet-group-description", f"W5 private subnets {cfg['group']}-{cfg['owner']}",
+                "--subnet-ids", *res["db_subnet_ids"], "--tags", json.dumps(tags_for(cfg, "w05", f"{name}-db-subnets")))
+        res["db_subnet_group"] = f"{name}-db-subnets"
+        save_resources(res)
+        log(f"created DB subnet group {res['db_subnet_group']}")
+    if not res.get("db_sg_id"):
+        sg = ops.aws("ec2", "create-security-group", "--group-name", f"{name}-db", "--vpc-id", res["vpc_id"],
+                     "--description", "W5 PostgreSQL 5432 from the host SG only",
+                     "--tag-specifications", tag_spec("security-group", tags_for(cfg, "w05", f"{name}-db")))["GroupId"]
+        res["db_sg_id"] = sg
+        save_resources(res)
+        perm = [{"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432,
+                 "UserIdGroupPairs": [{"GroupId": host_sg, "Description": "inspection host SG"}]}]
+        ops.aws("ec2", "authorize-security-group-ingress", "--group-id", sg, "--ip-permissions", json.dumps(perm))
+        log(f"created SG-db {sg}: TCP 5432 from {host_sg}")
+    if not res.get("db_instance_id"):
+        password = secrets.token_urlsafe(24)
+        write_db_env({"DB_HOST": "", "DB_PORT": "5432", "DB_NAME": DB_NAME, "DB_USER": DB_USER,
+                      "DB_PASSWORD": password})
+        request = {"DBInstanceIdentifier": ident, "Engine": "postgres", "DBInstanceClass": "db.t3.micro",
+                   "AllocatedStorage": 20, "StorageType": "gp3", "PubliclyAccessible": False,
+                   "StorageEncrypted": True, "MultiAZ": False, "AvailabilityZone": db_azs[0],
+                   "DBName": DB_NAME, "MasterUsername": DB_USER, "MasterUserPassword": password,
+                   "DBSubnetGroupName": res["db_subnet_group"], "VpcSecurityGroupIds": [res["db_sg_id"]],
+                   "BackupRetentionPeriod": 0, "CopyTagsToSnapshot": True,
+                   "Tags": tags_for(cfg, "w05", ident)}
+        with tempfile.NamedTemporaryFile("w", dir=LOCAL, prefix=".rds-", suffix=".json", delete=False) as tmp:
+            os.chmod(tmp.name, 0o600)
+            json.dump(request, tmp)
+        try:
+            ops.aws("rds", "create-db-instance", "--cli-input-json", f"file://{tmp.name}")
+        finally:
+            os.unlink(tmp.name)
+        del password, request
+        res["db_instance_id"] = ident
+        res["db_created_at"] = now()
+        save_resources(res)
+        log(f"create-db-instance {ident} requested (password only in .local/db.env, 600)")
+    last = None
+    while time.monotonic() - t0 < 1800:
+        db = describe_db(ops, ident)
+        if db and db["DBInstanceStatus"] != last:
+            last = db["DBInstanceStatus"]
+            log(f"RDS status: {last} ({time.monotonic() - t0:.0f}s)")
+        if last == "available":
+            break
+        time.sleep(15)
+    if last != "available":
+        raise lab.LabError("RDS did not become available in 30 minutes; do NOT rerun blindly, inspect first.")
+    env = read_kv(DB_ENV)
+    env["DB_HOST"] = db["Endpoint"]["Address"]
+    write_db_env(env)
+    print("Readback:")
+    print(json.dumps({"DBInstanceIdentifier": "...." + ident[-4:], "DBInstanceStatus": db["DBInstanceStatus"],
+                      "PubliclyAccessible": db["PubliclyAccessible"], "Engine": db["Engine"],
+                      "EngineVersion": db["EngineVersion"], "DBInstanceClass": db["DBInstanceClass"],
+                      "AllocatedStorage": db["AllocatedStorage"], "StorageType": db["StorageType"],
+                      "StorageEncrypted": db["StorageEncrypted"], "MultiAZ": db["MultiAZ"],
+                      "AvailabilityZone": db["AvailabilityZone"], "DBName": db.get("DBName"),
+                      "VpcSecurityGroups": [g["VpcSecurityGroupId"] for g in db["VpcSecurityGroups"]],
+                      "DBSubnetGroup": db["DBSubnetGroup"]["DBSubnetGroupName"]}, indent=2))
+    log(f"db-up.sh total {time.monotonic() - t0:.0f}s; .local/db.env updated with the endpoint (mode "
+        f"{oct(DB_ENV.stat().st_mode & 0o777)[2:]})")
+
+
 # ---------- 進入點 ----------
 
 def main():
@@ -537,13 +695,15 @@ def main():
     start = sub.add_parser("start", help="W4 T1：啟動保留的主機、記錄新位址、核對 SG 的 /32")
     deploy = sub.add_parser("deploy", help="W4：把已 commit 的版本與秘密檔部署到同一台主機")
     deploy.add_argument("--commit", default="HEAD")
-    for p in (up, down, start, deploy):
+    db_up = sub.add_parser("db-up", help="W5：私有子網×2、路由表、子網群組、SG-db、RDS PostgreSQL")
+    for p in (up, down, start, deploy, db_up):
         p.add_argument("--group")
         p.add_argument("--owner")
         p.add_argument("--source-cidr", dest="source_cidr")
     args = parser.parse_args()
     try:
-        {"up": cmd_up, "down": cmd_down, "start": cmd_start, "deploy": cmd_deploy}[args.command](args)
+        {"up": cmd_up, "down": cmd_down, "start": cmd_start, "deploy": cmd_deploy,
+         "db-up": cmd_db_up}[args.command](args)
     except (lab.LabError, EOFError, subprocess.CalledProcessError, KeyError, ValueError) as exc:
         print(f"STOP: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
