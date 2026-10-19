@@ -76,7 +76,8 @@ class EventApi(unittest.TestCase):
             (self.post(ok, token=None)[0], 401),
             (self.post(ok, token=OPERATOR)[0], 403),
             (self.post(no_tz), (400, "observed_at")),
-            (self.post(ok)[0], 409),
+            (self.post(ok)[0], 200),  # W4 是 409；W5 起同 ID 同內容重送回 200（冪等）
+            (self.post(dict(ok, note="changed"))[0], 409),
             (self.call("GET", "/events", REPORTER)[0], 403),
         ]
         for got, want in rows:

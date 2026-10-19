@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""巡檢服務：W3 /health；W4 事件 API（認證、授權、驗證）與顯示頁。
+"""巡檢服務：W3 /health；W4 事件 API（認證、授權、驗證）與顯示頁；W5 存進私有 RDS 並冪等。
 
-需相容主機上的 Python 3.9（Amazon Linux 2023）。不寫日誌、不回顯權杖或整份本文。
+需相容主機上的 Python 3.9（Amazon Linux 2023）。不寫日誌、不回顯權杖、整份本文或連線字串。
 """
 from datetime import datetime, timezone
 import hmac
@@ -72,8 +72,12 @@ def public(row):
     return out
 
 
+def same_content(stored, event):
+    return all(stored[k] == event[k] for k in ("device_id", "observed_at", "type", "note"))
+
+
 class MemoryStore:
-    """W4：事件只存在記憶體，服務重開就消失。"""
+    """沒有資料庫設定時使用：事件只存在記憶體，服務重開就消失。"""
     configured = False
 
     def __init__(self):
@@ -82,8 +86,9 @@ class MemoryStore:
 
     def add(self, event):
         with self.lock:
-            if event["event_id"] in self.rows:
-                return "exists", None
+            old = self.rows.get(event["event_id"])
+            if old is not None:
+                return ("duplicate" if same_content(old, event) else "conflict"), old
             row = dict(event, received_at=datetime.now(timezone.utc))
             self.rows[event["event_id"]] = row
             return "created", row
@@ -98,7 +103,75 @@ class MemoryStore:
             return self.rows.get(event_id)
 
 
-PAGE = """<!doctype html>
+SCHEMA = """CREATE TABLE IF NOT EXISTS events (
+  event_id varchar(64) PRIMARY KEY,
+  device_id varchar(32) NOT NULL,
+  observed_at timestamptz NOT NULL,
+  type varchar(16) NOT NULL CHECK (type IN ('status', 'anomaly', 'test')),
+  note varchar(200),
+  received_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS events_device_received ON events (device_id, received_at DESC)"""
+COLUMNS = ("event_id", "device_id", "observed_at", "type", "note", "received_at")
+DB_KEYS = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
+
+
+class PgStore:
+    """W5：事件存進私有 RDS PostgreSQL。重複交給主鍵判斷；所有 SQL 參數化；錯誤只回分類、不回細節。"""
+    configured = True
+
+    def __init__(self, env):
+        self.params = {"host": env["DB_HOST"], "port": env.get("DB_PORT") or "5432", "dbname": env["DB_NAME"],
+                       "user": env["DB_USER"], "password": env["DB_PASSWORD"], "sslmode": "verify-full",
+                       "sslrootcert": env.get("DB_SSLROOTCERT") or "/etc/inspection/rds-ca.pem",
+                       "connect_timeout": 5, "application_name": "inspection"}
+        self.lock = threading.Lock()
+        self.ready = False
+
+    def query(self, sql, params):
+        import psycopg2  # 只在主機上需要；離線測試走 MemoryStore
+        try:
+            conn = psycopg2.connect(**self.params)
+        except psycopg2.Error:
+            raise Reject(503, "database unavailable", "database")
+        try:
+            if not self.ready:
+                with self.lock:
+                    if not self.ready:
+                        with conn, conn.cursor() as cur:
+                            cur.execute(SCHEMA)
+                        self.ready = True
+            with conn, conn.cursor() as cur:
+                cur.execute(sql, params)
+                return [dict(zip(COLUMNS, row)) for row in cur.fetchall()] if cur.description else []
+        except psycopg2.Error:
+            raise Reject(503, "database error", "database")
+        finally:
+            conn.close()
+
+    def add(self, event):
+        rows = self.query(
+            "INSERT INTO events (event_id, device_id, observed_at, type, note) VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (event_id) DO NOTHING "
+            "RETURNING event_id, device_id, observed_at, type, note, received_at",
+            (event["event_id"], event["device_id"], event["observed_at"], event["type"], event["note"]))
+        if rows:
+            return "created", rows[0]
+        old = self.get(event["event_id"])
+        if old is None:
+            raise Reject(503, "database error", "database")
+        return ("duplicate" if same_content(old, event) else "conflict"), old
+
+    def list(self, limit=50):
+        return self.query("SELECT event_id, device_id, observed_at, type, note, received_at FROM events "
+                          "ORDER BY received_at DESC, event_id DESC LIMIT %s", (limit,))
+
+    def get(self, event_id):
+        rows = self.query("SELECT event_id, device_id, observed_at, type, note, received_at FROM events "
+                          "WHERE event_id = %s", (event_id,))
+        return rows[0] if rows else None
+
+
+PAGE ="""<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>巡檢事件</title>
 <style nonce="NONCE">body{font:15px system-ui,sans-serif;margin:24px;max-width:960px}
@@ -144,7 +217,8 @@ def make_server(version_file, port=8080, env=None, store=None):
     started = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     tokens = {"reporter": env.get("REPORTER_TOKEN", ""), "operator": env.get("OPERATOR_TOKEN", "")}
     auth_configured = all(len(t) >= 16 for t in tokens.values()) and tokens["reporter"] != tokens["operator"]
-    store = store or MemoryStore()
+    if store is None:
+        store = PgStore(env) if all(env.get(k) for k in DB_KEYS) else MemoryStore()
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
@@ -225,7 +299,9 @@ def make_server(version_file, port=8080, env=None, store=None):
                 result, row = store.add(event)
                 if result == "created":
                     return 201, public(row)
-                raise Reject(409, "event_id already exists", "event_id")
+                if result == "duplicate":  # 同 ID 同內容：冪等，不新增
+                    return 200, public(row)
+                raise Reject(409, "event_id already exists with different content", "event_id")
             if path == "/events" and method == "GET":
                 self.require("operator")
                 rows = store.list()
