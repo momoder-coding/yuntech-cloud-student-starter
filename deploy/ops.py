@@ -109,9 +109,11 @@ def curl(url, max_time=8):
 
 
 def ssh(host, command, stdin=None, timeout=120):
+    # 沒有要送的內容時不讓 ssh 讀我們自己的 stdin（否則會吃掉呼叫端腳本後面的指令）
+    feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
     return subprocess.run(["ssh", "-i", str(SSH_KEY), "-o", "StrictHostKeyChecking=accept-new",
                            "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", f"ec2-user@{host}", command],
-                          input=stdin, capture_output=True, timeout=timeout)
+                          capture_output=True, timeout=timeout, **feed)
 
 
 def git(*args):
@@ -419,8 +421,17 @@ def cmd_start(args):
     inst = describe_instance(ops, res["instance_id"])
     check_owner_tags(f"instance {res['instance_id']}", inst.get("Tags"), cfg)
     old_ip = res.get("public_ip")
+    db = describe_db(ops, res["db_instance_id"]) if res.get("db_instance_id") else None
+    if db:
+        log(f"RDS {res['db_instance_id']} status: {db['DBInstanceStatus']}")
+    if inst["State"]["Name"] == "stopped" or (db and db["DBInstanceStatus"] == "stopped"):
+        confirm([f"Plan (start): START instance {res['instance_id']} ({inst['State']['Name']})"
+                 + (f" and RDS {res['db_instance_id']} ({db['DBInstanceStatus']})" if db else "")
+                 + "; no new resources"])
+    if db and db["DBInstanceStatus"] == "stopped":  # RDS 要好幾分鐘，先發出啟動、不必等它
+        ops.aws("rds", "start-db-instance", "--db-instance-identifier", res["db_instance_id"])
+        log("RDS start requested")
     if inst["State"]["Name"] == "stopped":
-        confirm([f"Plan (start): START instance {res['instance_id']} (stopped); no new resources"])
         ops.aws("ec2", "start-instances", "--instance-ids", res["instance_id"])
         wait_state(ops, res["instance_id"], "running")
     else:
@@ -448,6 +459,10 @@ def cmd_start(args):
         cfg["source_cidr"] = new
         lab.atomic_write(CONFIG, json.dumps(cfg) + "\n")
         log(f"SG rules now {sorted(sg_cidrs(ops, res['sg_id']))}")
+    if db:
+        while describe_db(ops, res["db_instance_id"])["DBInstanceStatus"] != "available":
+            time.sleep(15)
+        log(f"RDS {res['db_instance_id']} is available")
     for _ in range(100):
         exit_code, code, body, _ = curl(f"http://{ip}/health", 5)
         if code == "200":
@@ -492,6 +507,10 @@ def cmd_deploy(args):
     ip = inst["PublicIpAddress"]
     res["public_ip"] = ip
     payload, secret_files = secrets_payload()
+    iot = iot_payloads(cfg)
+    if iot:
+        payload += iot[0]
+        secret_files.append("iot/endpoint (IOT_ lines)")
     warn_dirty()
     sha, user_data, size = build_user_data(args.commit)
     confirm([
@@ -499,6 +518,8 @@ def cmd_deploy(args):
         f"  target   {res['instance_id']} at {ip}",
         f"  commit   {sha} (user data {size} bytes, committed files only)",
         f"  secrets  .local/{' + .local/'.join(secret_files)} -> /etc/inspection/app.env (root, 600) via SSH stdin",
+        *(["  iot      consumer cert, key, Root CA -> /etc/inspection/iot/ (dir 700, files 600, owner inspection)",
+           "           then restart inspection-consumer"] if iot else []),
         "  then     restart inspection and check /health version",
     ])
     t0 = time.monotonic()
@@ -511,6 +532,14 @@ def cmd_deploy(args):
     if r.returncode:
         raise lab.LabError("Placing the secret file failed (output withheld).")
     log("secret file placed: " + r.stdout.decode().strip().replace("\n", "; "))
+    if iot:
+        for name, data in iot[1].items():
+            r = ssh(ip, PUT_IOT_FILE.replace("NAME", name), stdin=data)
+            if r.returncode:
+                raise lab.LabError(f"Placing /etc/inspection/iot/{name} failed (output withheld).")
+        r = ssh(ip, "sudo systemctl restart inspection-consumer; sleep 3; "
+                    "systemctl is-active inspection inspection-consumer | paste -sd' '")
+        log("consumer files placed; systemctl is-active inspection inspection-consumer: " + r.stdout.decode().strip())
     expect_db = "db.env" in secret_files
     for _ in range(60):
         exit_code, code, body, _ = curl(f"http://{ip}/health", 5)
@@ -527,6 +556,53 @@ def cmd_deploy(args):
             return
         time.sleep(2)
     raise lab.LabError(f"/health did not report version {sha} with secrets configured; last: http={code} {body}")
+
+
+# ---------- W5 T4／W6 步驟 8：保留（停止主機與 RDS） ----------
+
+def short(rid):
+    return "…" + rid[-4:]
+
+
+def cmd_keep(args):
+    ops = Ops()
+    cfg = load_config(args)
+    res = load(RESOURCES, {})
+    inst = describe_instance(ops, res["instance_id"])
+    check_owner_tags(f"instance {res['instance_id']}", inst.get("Tags"), cfg)
+    db = describe_db(ops, res["db_instance_id"]) if res.get("db_instance_id") else None
+    confirm(["Plan (keep) — STOP only, nothing is deleted:",
+             f"  EC2 {res['instance_id']} ({inst['State']['Name']}) -> stop",
+             *([f"  RDS {res['db_instance_id']} ({db['DBInstanceStatus']}) -> stop "
+                "(AWS auto-starts it after 7 days stopped)"] if db else []),
+             "  kept: SG, key pair, EBS, ENI" + (", private subnets, route table, DB subnet group, SG-db"
+                                                  if db else "")])
+    if inst["State"]["Name"] not in ("stopped", "stopping"):
+        out = ops.aws("ec2", "stop-instances", "--instance-ids", res["instance_id"], "--query",
+                      "StoppingInstances[0].CurrentState.Name", "--output", "text", raw=True)
+        log(f"ec2 stop-instances -> {out}")
+    if db and db["DBInstanceStatus"] == "available":
+        out = ops.aws("rds", "stop-db-instance", "--db-instance-identifier", res["db_instance_id"], "--query",
+                      "DBInstance.DBInstanceStatus", "--output", "text", raw=True)
+        log(f"rds stop-db-instance -> {out}")
+    wait_state(ops, res["instance_id"], "stopped")
+    while db and describe_db(ops, res["db_instance_id"])["DBInstanceStatus"] != "stopped":
+        time.sleep(15)
+    print("Readback:")
+    print(f"  EC2 {short(res['instance_id'])}: {describe_instance(ops, res['instance_id'])['State']['Name']}")
+    if db:
+        print(f"  RDS {short(res['db_instance_id'])}: {describe_db(ops, res['db_instance_id'])['DBInstanceStatus']}")
+    for role in ("gw", "consumer"):
+        if res.get(f"iot_{role}_cert_id"):
+            st = ops.aws("iot", "describe-certificate", "--certificate-id", res[f"iot_{role}_cert_id"], "--query",
+                         "certificateDescription.status", "--output", "text", raw=True)
+            print(f"  IoT {role} certificate {short(res[f'iot_{role}_cert_id'])}: {st}")
+    print("Kept (ID last 4): EC2 {}, SG {}, key {}, EBS {}, ENI {}".format(
+        *(short(res[k]) for k in ("instance_id", "sg_id", "key_pair_id", "volume_id", "eni_id"))))
+    if db:
+        print("Kept (ID last 4): RDS {}, subnets {}, route table {}, SG-db {}, subnet group {}".format(
+            short(res["db_instance_id"]), [short(s) for s in res["db_subnet_ids"]], short(res["db_route_table_id"]),
+            short(res["db_sg_id"]), res["db_subnet_group"]))
 
 
 # ---------- W5：db-up ----------
@@ -683,6 +759,120 @@ def cmd_db_up(args):
         f"{oct(DB_ENV.stat().st_mode & 0o777)[2:]})")
 
 
+# ---------- W6：iot-up ----------
+
+IOT_DIR = LOCAL / "iot"
+ROOT_CA_URL = "https://www.amazontrust.com/repository/AmazonRootCA1.pem"
+
+
+def iot_names(cfg):
+    code = f"{cfg['group']}-{cfg['owner']}"
+    return {"code": code, "topic": f"cxe/{code}/gw/events", "gw_client": f"gw-{code}",
+            "consumer_client": f"consumer-{code}", "gw_policy": f"cxe-{code}-gw",
+            "consumer_policy": f"cxe-{code}-consumer",
+            "devices": [f"{code}-d{i:02d}" for i in range(1, 11)]}
+
+
+def write_secret_file(path, text):
+    IOT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    IOT_DIR.chmod(0o700)
+    if path.exists():
+        raise lab.LabError(f"{path.name} already exists; refusing to overwrite a key or certificate.")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(text)
+
+
+def cmd_iot_up(args):
+    ops = Ops()
+    cfg = load_config(args)
+    res = load(RESOURCES, {})
+    n = iot_names(cfg)
+    arn = f"arn:aws:iot:{ops.region}:{ops.ctx['account']}"
+    policies = {
+        "gw": {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "iot:Connect", "Resource": f"{arn}:client/{n['gw_client']}"},
+            {"Effect": "Allow", "Action": "iot:Publish", "Resource": f"{arn}:topic/{n['topic']}"}]},
+        "consumer": {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "iot:Connect", "Resource": f"{arn}:client/{n['consumer_client']}"},
+            {"Effect": "Allow", "Action": "iot:Subscribe", "Resource": f"{arn}:topicfilter/{n['topic']}"},
+            {"Effect": "Allow", "Action": "iot:Receive", "Resource": f"{arn}:topic/{n['topic']}"}]},
+    }
+    skip = [k for k in ("iot_gw_cert_id", "iot_consumer_cert_id", "iot_gw_policy", "iot_consumer_policy")
+            if res.get(k)]
+    confirm([
+        "Plan (W6 iot-up.sh) — will CREATE in AWS IoT Core:",
+        f"  2 certificates (ACTIVE): gateway, consumer; private keys written straight to .local/iot/ (700/600)",
+        f"  policy {n['gw_policy']}: Connect client/{n['gw_client']}; Publish topic/{n['topic']}",
+        f"  policy {n['consumer_policy']}: Connect client/{n['consumer_client']}; "
+        f"Subscribe topicfilter/{n['topic']}; Receive topic/{n['topic']}",
+        "  attach each policy to its certificate; download Amazon Root CA 1; no wildcards",
+        "  cost   idle certificates/policies are free; messages billed per million (tiny here)",
+        "  skip   already recorded: " + (", ".join(skip) or "none"),
+    ])
+    IOT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    IOT_DIR.chmod(0o700)
+    endpoint = ops.aws("iot", "describe-endpoint", "--endpoint-type", "iot:Data-ATS")["endpointAddress"]
+    (IOT_DIR / "endpoint").write_text(endpoint + "\n")
+    log(f"endpoint saved to .local/iot/endpoint ({endpoint.split('.')[0][:4]}...{endpoint[-24:]})")
+    for role in ("gw", "consumer"):
+        key = f"iot_{role}_cert_id"
+        if not res.get(key):
+            out = ops.aws("iot", "create-keys-and-certificate", "--set-as-active")  # 輸出只留在記憶體
+            write_secret_file(IOT_DIR / f"{role}.private.key", out["keyPair"]["PrivateKey"])
+            write_secret_file(IOT_DIR / f"{role}.cert.pem", out["certificatePem"])
+            res[key] = out["certificateId"]
+            res[f"iot_{role}_cert_arn"] = out["certificateArn"]
+            save_resources(res)
+            del out
+            log(f"created {role} certificate {res[key]} (key/cert written to .local/iot/, not shown)")
+        pkey = f"iot_{role}_policy"
+        if not res.get(pkey):
+            name = n[f"{role}_policy"]
+            ops.aws("iot", "create-policy", "--policy-name", name, "--policy-document", json.dumps(policies[role]),
+                    "--tags", json.dumps(tags_for(cfg, "w06", name)[:4]))
+            res[pkey] = name
+            save_resources(res)
+            log(f"created policy {name}")
+        ops.aws("iot", "attach-policy", "--policy-name", res[pkey], "--target", res[f"iot_{role}_cert_arn"])
+        log(f"attached {res[pkey]} -> certificate {res[key]}")
+    ca = IOT_DIR / "AmazonRootCA1.pem"
+    if not ca.exists():
+        subprocess.run(["curl", "--fail", "--silent", "--show-error", "--proto", "=https", "--tlsv1.2",
+                        "-o", str(ca), ROOT_CA_URL], check=True)
+        ca.chmod(0o600)
+        log("downloaded Amazon Root CA 1 to .local/iot/AmazonRootCA1.pem")
+    print("Readback:")
+    for role in ("gw", "consumer"):
+        cert = ops.aws("iot", "describe-certificate", "--certificate-id", res[f"iot_{role}_cert_id"])
+        attached = ops.aws("iot", "list-attached-policies", "--target", res[f"iot_{role}_cert_arn"])["policies"]
+        print(f"  {role} certificate {res[f'iot_{role}_cert_id'][:12]}...: "
+              f"{cert['certificateDescription']['status']}; policies {[p['policyName'] for p in attached]}")
+    modes = sorted(f"{oct(p.stat().st_mode & 0o777)[2:]} {p.name}" for p in IOT_DIR.iterdir())
+    print(f"  .local/iot ({oct(IOT_DIR.stat().st_mode & 0o777)[2:]}): {modes}")
+
+
+def iot_payloads(cfg):
+    """W6：consumer 需要的 IOT_ 設定行與三個檔案；.local/iot 不存在時回傳 None。"""
+    if not (IOT_DIR / "consumer.private.key").exists():
+        return None
+    n = iot_names(cfg)
+    files = {name: (IOT_DIR / name).read_bytes()
+             for name in ("AmazonRootCA1.pem", "consumer.cert.pem", "consumer.private.key")}
+    lines = {"IOT_ENDPOINT": (IOT_DIR / "endpoint").read_text().strip(), "IOT_TOPIC": n["topic"],
+             "IOT_CLIENT_ID": n["consumer_client"], "IOT_DEVICE_IDS": ",".join(n["devices"]),
+             "IOT_CA": "/etc/inspection/iot/AmazonRootCA1.pem",
+             "IOT_CERT": "/etc/inspection/iot/consumer.cert.pem",
+             "IOT_KEY": "/etc/inspection/iot/consumer.private.key"}
+    return "".join(f"{k}={v}\n" for k, v in lines.items()).encode(), files
+
+
+PUT_IOT_FILE = ("sudo sh -c 'umask 077; install -d -o inspection -g inspection -m 700 /etc/inspection/iot && "
+                "cat > /etc/inspection/iot/.NAME.new && chown inspection:inspection /etc/inspection/iot/.NAME.new && "
+                "chmod 600 /etc/inspection/iot/.NAME.new && mv -f /etc/inspection/iot/.NAME.new "
+                "/etc/inspection/iot/NAME'")
+
+
 # ---------- 進入點 ----------
 
 def main():
@@ -696,14 +886,16 @@ def main():
     deploy = sub.add_parser("deploy", help="W4：把已 commit 的版本與秘密檔部署到同一台主機")
     deploy.add_argument("--commit", default="HEAD")
     db_up = sub.add_parser("db-up", help="W5：私有子網×2、路由表、子網群組、SG-db、RDS PostgreSQL")
-    for p in (up, down, start, deploy, db_up):
+    iot_up = sub.add_parser("iot-up", help="W6：IoT 憑證×2、精確政策×2、Root CA")
+    keep = sub.add_parser("keep", help="W5 T4／W6 步驟 8：停止主機與 RDS 並讀回保留清單")
+    for p in (up, down, start, deploy, db_up, iot_up, keep):
         p.add_argument("--group")
         p.add_argument("--owner")
         p.add_argument("--source-cidr", dest="source_cidr")
     args = parser.parse_args()
     try:
         {"up": cmd_up, "down": cmd_down, "start": cmd_start, "deploy": cmd_deploy,
-         "db-up": cmd_db_up}[args.command](args)
+         "db-up": cmd_db_up, "iot-up": cmd_iot_up, "keep": cmd_keep}[args.command](args)
     except (lab.LabError, EOFError, subprocess.CalledProcessError, KeyError, ValueError) as exc:
         print(f"STOP: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
