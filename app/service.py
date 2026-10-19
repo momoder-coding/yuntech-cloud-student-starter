@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""巡檢服務：W3 /health；W4 事件 API（認證、授權、驗證）與顯示頁；W5 存進私有 RDS 並冪等。
+"""巡檢服務：W3 /health；W4 事件 API 與顯示頁；W5 存進私有 RDS 並冪等；W6 依設備篩選。
 
 需相容主機上的 Python 3.9（Amazon Linux 2023）。不寫日誌、不回顯權杖、整份本文或連線字串。
 """
@@ -93,10 +93,10 @@ class MemoryStore:
             self.rows[event["event_id"]] = row
             return "created", row
 
-    def list(self, limit=50):
+    def list(self, device_id=None, limit=50):
         with self.lock:
-            rows = sorted(self.rows.values(), key=lambda r: r["received_at"], reverse=True)
-        return rows[:limit]
+            rows = [r for r in self.rows.values() if device_id is None or r["device_id"] == device_id]
+        return sorted(rows, key=lambda r: r["received_at"], reverse=True)[:limit]
 
     def get(self, event_id):
         with self.lock:
@@ -161,9 +161,13 @@ class PgStore:
             raise Reject(503, "database error", "database")
         return ("duplicate" if same_content(old, event) else "conflict"), old
 
-    def list(self, limit=50):
+    def list(self, device_id=None, limit=50):
+        if device_id is None:
+            return self.query("SELECT event_id, device_id, observed_at, type, note, received_at FROM events "
+                              "ORDER BY received_at DESC, event_id DESC LIMIT %s", (limit,))
         return self.query("SELECT event_id, device_id, observed_at, type, note, received_at FROM events "
-                          "ORDER BY received_at DESC, event_id DESC LIMIT %s", (limit,))
+                          "WHERE device_id = %s ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                          (device_id, limit))
 
     def get(self, event_id):
         rows = self.query("SELECT event_id, device_id, observed_at, type, note, received_at FROM events "
@@ -179,6 +183,7 @@ table{border-collapse:collapse;width:100%;margin-top:12px}td,th{border:1px solid
 input{padding:4px;margin-right:6px}#msg{margin-top:8px;color:#a00}</style></head>
 <body><h1>巡檢事件</h1>
 <label>operator 權杖 <input id="token" type="password" autocomplete="off"></label>
+<label>設備編號 <input id="device" placeholder="例如 g06-m01-d01" autocomplete="off"></label>
 <button id="load">讀取</button> <button id="clear">清空權杖</button>
 <div id="msg"></div>
 <table><thead><tr><th>event_id</th><th>device_id</th><th>observed_at</th><th>type</th><th>note</th>
@@ -191,7 +196,9 @@ $("load").onclick = async () => {
   const rows = $("rows");
   $("msg").textContent = "";
   rows.replaceChildren();
-  const resp = await fetch("/events", {headers: {"Authorization": "Bearer " + token}, cache: "no-store"});
+  const device = $("device").value.trim();
+  const url = device ? "/events?device_id=" + encodeURIComponent(device) : "/events";
+  const resp = await fetch(url, {headers: {"Authorization": "Bearer " + token}, cache: "no-store"});
   const data = await resp.json();
   if (!resp.ok) { $("msg").textContent = resp.status + " " + data.error; return; }
   for (const ev of data.events) {
@@ -203,7 +210,7 @@ $("load").onclick = async () => {
     }
     rows.appendChild(tr);
   }
-  $("msg").textContent = data.events.length + " 筆";
+  $("msg").textContent = (device ? "設備 " + device + "：" : "全部：") + data.events.length + " 筆";
 };
 </script></body></html>
 """
@@ -304,8 +311,11 @@ def make_server(version_file, port=8080, env=None, store=None):
                 raise Reject(409, "event_id already exists with different content", "event_id")
             if path == "/events" and method == "GET":
                 self.require("operator")
-                rows = store.list()
-                return 200, {"count": len(rows), "events": [public(r) for r in rows]}
+                device = parse_qs(url.query).get("device_id", [None])[-1]
+                if device is not None and not DEVICE_ID.fullmatch(device):
+                    raise Reject(400, "must be 1-32 characters of A-Z a-z 0-9 - _", "device_id")
+                rows = store.list(device_id=device)
+                return 200, {"count": len(rows), "device_id": device, "events": [public(r) for r in rows]}
             if path.startswith("/events/") and method == "GET":
                 self.require("operator")
                 row = store.get(path[len("/events/"):])
