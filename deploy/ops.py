@@ -813,7 +813,7 @@ def cmd_iot_up(args):
     IOT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     IOT_DIR.chmod(0o700)
     endpoint = ops.aws("iot", "describe-endpoint", "--endpoint-type", "iot:Data-ATS")["endpointAddress"]
-    (IOT_DIR / "endpoint").write_text(endpoint + "\n")
+    lab.atomic_write(IOT_DIR / "endpoint", endpoint + "\n")  # 600，不受 umask 影響
     log(f"endpoint saved to .local/iot/endpoint ({endpoint.split('.')[0][:4]}...{endpoint[-24:]})")
     for role in ("gw", "consumer"):
         key = f"iot_{role}_cert_id"
